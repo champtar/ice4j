@@ -248,11 +248,11 @@ abstract class MultiplexingXXXSocketSupport
                 if (getFilter(socket).accept(p))
                 {
                     List<DatagramPacket> socketReceived = getReceived(socket);
+                    DatagramPacket d = accepted ? clone(p, /* arraycopy */ true) : p;
 
                     synchronized (socketReceived)
                     {
-                        socketReceived.add(
-                                accepted ? clone(p, /* arraycopy */ true) : p);
+                        socketReceived.add(d);
                         socketReceived.notifyAll();
                     }
                     accepted = true;
