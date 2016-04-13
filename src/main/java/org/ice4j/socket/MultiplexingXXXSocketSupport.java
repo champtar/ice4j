@@ -21,6 +21,9 @@ import java.io.*;
 import java.lang.reflect.*;
 import java.net.*;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.*;
+import java.util.concurrent.locks.*;
 import java.util.logging.*;
 
 /**
@@ -189,31 +192,15 @@ abstract class MultiplexingXXXSocketSupport
     }
 
     /**
-     * The indicator which determines whether this <tt>DatagramSocket</tt> is
-     * currently reading from the network using
-     * {@link DatagramSocket#receive(DatagramPacket)}. When <tt>true</tt>,
-     * subsequent requests to read from the network will be blocked until the
-     * current read is finished.
-     */
-    private boolean inReceive = false;
+-     * The value with which {@link DatagramSocket#setReceiveBufferSize(int)} is
+-     * to be invoked if {@code receiveBufferSize > 0}
+-     */
+    private AtomicInteger receiveBufferSize = new AtomicInteger(-1);
 
     /**
-     * The value with which {@link DatagramSocket#setReceiveBufferSize(int)} is
-     * to be invoked if {@link #setReceiveBufferSize} is <tt>true</tt>. 
+     * The <tt>Lock</tt> which synchronizes the receive operation
      */
-    private int receiveBufferSize;
-
-    /**
-     * The <tt>Object</tt> which synchronizes the access to {@link #inReceive}.
-     */
-    private final Object receiveSyncRoot = new Object();
-
-    /**
-     * The indicator which determines whether
-     * {@link DatagramSocket#setReceiveBufferSize(int)} is to be invoked with
-     * the value of {@link #receiveBufferSize}.
-     */
-    private boolean setReceiveBufferSize = false;
+    private final ReentrantLock receiveLock = new ReentrantLock();
 
     /**
      * The IP sockets filtering {@code DatagramPacket}s away from this IP
@@ -247,14 +234,9 @@ abstract class MultiplexingXXXSocketSupport
             {
                 if (getFilter(socket).accept(p))
                 {
-                    List<DatagramPacket> socketReceived = getReceived(socket);
+                    SocketReceiveBuffer socketReceived = getReceived(socket);
                     DatagramPacket d = accepted ? clone(p, /* arraycopy */ true) : p;
-
-                    synchronized (socketReceived)
-                    {
-                        socketReceived.add(d);
-                        socketReceived.notifyAll();
-                    }
+                    socketReceived.add(d);
                     accepted = true;
 
                     // Emil Ivov: Don't break because we want all
@@ -263,13 +245,8 @@ abstract class MultiplexingXXXSocketSupport
             }
             if (!accepted)
             {
-                List<DatagramPacket> thisReceived = getReceived();
-
-                synchronized (thisReceived)
-                {
-                    thisReceived.add(p);
-                    thisReceived.notifyAll();
-                }
+                SocketReceiveBuffer thisReceived = getReceived();
+                thisReceived.add(p);
             }
         }
     }
@@ -349,7 +326,7 @@ abstract class MultiplexingXXXSocketSupport
      * not accepted by any (existing) {@code DatagramPacketFilter} at the time of
      * receipt
      */
-    protected abstract List<DatagramPacket> getReceived();
+    protected abstract SocketReceiveBuffer getReceived();
 
     /**
      * Gets the list of {@code DatagramPacket}s received by this multiplexing
@@ -362,7 +339,7 @@ abstract class MultiplexingXXXSocketSupport
      * socket and accepted by the {@code DatagramPacketFilter} of the
      * multiplexed {@code socket} at the time of receipt
      */
-    protected abstract List<DatagramPacket> getReceived(
+    protected abstract SocketReceiveBuffer getReceived(
             MultiplexedXXXSocketT socket);
 
     /**
@@ -467,35 +444,33 @@ abstract class MultiplexingXXXSocketSupport
     {
         // Pull the packets which have been received already and are accepted by
         // the specified multiplexed socket out of the multiplexing socket.
-        List<DatagramPacket> thisReceived = getReceived();
+        SocketReceiveBuffer thisReceived = getReceived();
         DatagramPacketFilter socketFilter = getFilter(socket);
         List<DatagramPacket> toMove = null;
 
-        synchronized (thisReceived)
-        {
-            if (thisReceived.isEmpty())
-            {
+        final ReentrantLock thisReceivedLock = thisReceived.lock;
+        thisReceivedLock.lock();
+        try {
+            if (thisReceived.bufList.isEmpty())
                 return;
-            }
-            else
+
+            for (Iterator<DatagramPacket> i = thisReceived.bufList.iterator();
+                i.hasNext();)
             {
-                for (Iterator<DatagramPacket> i = thisReceived.iterator();
-                        i.hasNext();)
+                DatagramPacket p = i.next();
+                if (socketFilter.accept(p))
                 {
-                    DatagramPacket p = i.next();
+                    if (toMove == null)
+                        toMove = new LinkedList<>();
+                    toMove.add(p);
 
-                    if (socketFilter.accept(p))
-                    {
-                        if (toMove == null)
-                            toMove = new LinkedList<>();
-                        toMove.add(p);
-
-                        // XXX In the method receive, we allow multiple filters
-                        // to accept one and the same packet.
-                        i.remove();
-                    }
+                    // XXX In the method receive, we allow multiple filters
+                    // to accept one and the same packet.
+                    i.remove();
                 }
             }
+        } finally {
+            thisReceivedLock.unlock();
         }
 
         // Push the packets which have been accepted already and are accepted by
@@ -503,17 +478,8 @@ abstract class MultiplexingXXXSocketSupport
         // question.
         if (toMove != null)
         {
-            List<DatagramPacket> socketReceived = getReceived(socket);
-
-            synchronized (socketReceived)
-            {
-                socketReceived.addAll(toMove);
-                // The notifyAll will practically likely be unnecessary because
-                // the specified socket will likely be a newly-created one to
-                // which noone else has a reference. Anyway, dp the invocation
-                // for the purposes of consistency, clarity, and such.
-                socketReceived.notifyAll();
-            }
+            SocketReceiveBuffer socketReceived = getReceived(socket);
+            socketReceived.addAll(toMove);
         }
     }
 
@@ -536,28 +502,21 @@ abstract class MultiplexingXXXSocketSupport
      * @throws SocketTimeoutException if <tt>timeout</tt> is positive and has
      * expired
      */
-    void receive(List<DatagramPacket> received, DatagramPacket p, int timeout)
+    void receive(SocketReceiveBuffer received, DatagramPacket p, int timeout)
         throws IOException
     {
         long startTime = System.currentTimeMillis();
-        DatagramPacket r = null;
 
-        do
+        while (true)
         {
-            long now = System.currentTimeMillis();
-
             // If there is a packet which has been received from the network and
             // is to merely be received from the list of received
             // DatagramPackets, then let it be received and do not throw a
             // SocketTimeoutException.
-            synchronized (received)
-            {
-                if (!received.isEmpty())
-                {
-                    r = received.remove(0);
-                    if (r != null)
-                        break;
-                }
+            DatagramPacket r = received.poll();
+            if (r != null) {
+                copy(r, p);
+                return;
             }
 
             // Throw a SocketTimeoutException if the timeout is over/up.
@@ -565,7 +524,7 @@ abstract class MultiplexingXXXSocketSupport
 
             if (timeout > 0)
             {
-                remainingTimeout = timeout - (now - startTime);
+                remainingTimeout = timeout - (System.currentTimeMillis() - startTime);
                 if (remainingTimeout <= 0L)
                 {
                     throw new SocketTimeoutException(
@@ -577,56 +536,11 @@ abstract class MultiplexingXXXSocketSupport
                 remainingTimeout = 1000L;
             }
 
-            // Determine whether the caller will receive from the network or
-            // will wait for a previous caller to receive from the network.
-            boolean wait;
-
-            synchronized (receiveSyncRoot)
-            {
-                if (inReceive)
+            if (receiveLock.tryLock()) {
+                try
                 {
-                    wait = true;
-                }
-                else
-                {
-                    wait = false;
-                    inReceive = true;
-                }
-            }
-            try
-            {
-                if (wait)
-                {
-                    // The caller will wait for a previous caller to receive
-                    // from the network.
-                    synchronized (received)
-                    {
-                        if (received.isEmpty())
-                        {
-                            try
-                            {
-                                received.wait(remainingTimeout);
-                            }
-                            catch (InterruptedException ie)
-                            {
-                            }
-                        }
-                        else
-                        {
-                            received.notifyAll();
-                        }
-                    }
-                    continue;
-                }
-
-                // The caller will receive from the network.
-                DatagramPacket c = clone(p, /* arraycopy */ false);
-
-                synchronized (receiveSyncRoot)
-                {
-                    if (setReceiveBufferSize)
-                    {
-                        setReceiveBufferSize = false;
+                    int receiveBufferSize = this.receiveBufferSize.getAndSet(0);
+                    if (receiveBufferSize > 0) {
                         try
                         {
                             doSetReceiveBufferSize(receiveBufferSize);
@@ -637,25 +551,35 @@ abstract class MultiplexingXXXSocketSupport
                                 throw (ThreadDeath) t;
                         }
                     }
-                }
-                doReceive(c);
+                    // The caller will receive from the network.
+                    DatagramPacket c = clone(p, /* arraycopy */ false);
 
-                // The caller received from the network. Copy/add the packet to
-                // the receive list of the sockets which accept it.
-                acceptBySocketsOrThis(c);
-            }
-            finally
-            {
-                synchronized (receiveSyncRoot)
+                    doReceive(c);
+
+                    // The caller received from the network. Copy/add the packet to
+                    // the receive list of the sockets which accept it.
+                    acceptBySocketsOrThis(c);
+                }
+                finally
                 {
-                    if (!wait)
-                        inReceive = false;
+                    receiveLock.unlock();
+                }
+            } else {
+                // The caller will wait for a previous caller to receive
+                // from the network.
+                try
+                {
+                    r = received.poll(remainingTimeout, TimeUnit.MILLISECONDS);
+                    if (r != null) {
+                        copy(r, p);
+                        return;
+                    }
+                }
+                catch (InterruptedException ie)
+                {
                 }
             }
         }
-        while (true);
-
-        copy(r, p);
     }
 
     /**
@@ -672,19 +596,6 @@ abstract class MultiplexingXXXSocketSupport
     public void setReceiveBufferSize(int receiveBufferSize)
         throws SocketException
     {
-        synchronized (receiveSyncRoot)
-        {
-            this.receiveBufferSize = receiveBufferSize;
-
-            if (inReceive)
-            {
-                setReceiveBufferSize = true;
-            }
-            else
-            {
-                doSetReceiveBufferSize(receiveBufferSize);
-                setReceiveBufferSize = false;
-            }
-        }
+        this.receiveBufferSize.set(receiveBufferSize);
     }
 }

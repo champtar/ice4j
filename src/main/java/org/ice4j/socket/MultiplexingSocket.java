@@ -92,7 +92,7 @@ public class MultiplexingSocket
                  * {@inheritDoc}
                  */
                 @Override
-                protected List<DatagramPacket> getReceived()
+                protected SocketReceiveBuffer getReceived()
                 {
                     return received;
                 }
@@ -101,7 +101,7 @@ public class MultiplexingSocket
                  * {@inheritDoc}
                  */
                 @Override
-                protected List<DatagramPacket> getReceived(
+                protected SocketReceiveBuffer getReceived(
                         MultiplexedSocket socket)
                 {
                     return socket.received;
@@ -118,12 +118,9 @@ public class MultiplexingSocket
      * <tt>Socket</tt> i.e. not accepted by the <tt>DatagramFilter</tt>s of
      * {@link #sockets} at the time of the reading from the network.
      */
-    private final List<DatagramPacket> received
+    private final SocketReceiveBuffer received
         = new SocketReceiveBuffer()
         {
-            private static final long serialVersionUID
-                = 4097024214973676873L;
-
             @Override
             public int getReceiveBufferSize()
                 throws SocketException

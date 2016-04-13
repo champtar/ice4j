@@ -19,21 +19,18 @@ package org.ice4j.socket;
 
 import java.net.*;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.locks.*;
 
 /**
  * Implements a list of <tt>DatagramPacket</tt>s received by a
  * <tt>DatagramSocket</tt> or a <tt>Socket</tt>. The list enforces the
  * <tt>SO_RCVBUF</tt> option for the associated <tt>DatagramSocket</tt> or
  * <tt>Socket</tt>.
- *
- * @author Lyubomir Marinov
  */
 abstract class SocketReceiveBuffer
-    extends LinkedList<DatagramPacket>
 {
     private static final int DEFAULT_RECEIVE_BUFFER_SIZE = 1024 * 1024;
-
-    private static final long serialVersionUID = 2804762379509257652L;
 
     /**
      * The value of the <tt>SO_RCVBUF</tt> option for the associated
@@ -48,67 +45,191 @@ abstract class SocketReceiveBuffer
     private int size;
 
     /**
-     * {@inheritDoc}
+     * 
      */
-    @Override
+    final LinkedList<DatagramPacket> bufList;
+
+    /**
+     * 
+     */
+    final ReentrantLock lock;
+    
+    /**
+     * 
+     */
+    final Condition notEmpty;
+
+    /**
+     * 
+     */
+    public SocketReceiveBuffer() {
+        bufList = new LinkedList<>();
+        lock = new ReentrantLock();
+        notEmpty = lock.newCondition();
+    }
+
+    /**
+     *
+     */
     public boolean add(DatagramPacket p)
     {
-        boolean added = super.add(p);
+        if (p == null) throw new NullPointerException();
 
-        // Keep track of the (total) size in bytes of this receive buffer in
-        // order to be able to enforce SO_RCVBUF.
-        if (added && (p != null))
-        {
-            int pSize = p.getLength();
-
-            if (pSize > 0)
-            {
-                size += pSize;
-
-                // If the added packet is the only element of this list, do not
-                // drop it because of the enforcement of SO_RCVBUF.
-                if (size() > 1)
-                {
-                    // For the sake of performance, do not invoke the method
-                    // getReceiveBufferSize() of DatagramSocket or Socket on
-                    // every packet added to this buffer.
-                    int receiveBufferSize = this.receiveBufferSize;
-
-                    if ((receiveBufferSize <= 0) || (modCount % 1000 == 0))
-                    {
-                        try
-                        {
-                            receiveBufferSize = getReceiveBufferSize();
-                        }
-                        catch (SocketException sex)
-                        {
-                        }
-                        if (receiveBufferSize <= 0)
-                        {
-                            receiveBufferSize = DEFAULT_RECEIVE_BUFFER_SIZE;
-                        }
-                        else if (receiveBufferSize
-                                < DEFAULT_RECEIVE_BUFFER_SIZE)
-                        {
-                            // Well, a manual page on SO_RCVBUF talks about
-                            // doubling. In order to stay on the safe side and
-                            // given that there was no limit on the size of the
-                            // buffer before, double the receive buffer size.
-                            receiveBufferSize *= 2;
-                            if (receiveBufferSize <= 0)
-                            {
-                                receiveBufferSize
-                                    = DEFAULT_RECEIVE_BUFFER_SIZE;
-                            }
-                        }
-                        this.receiveBufferSize = receiveBufferSize;
-                    }
-                    if (size > receiveBufferSize)
-                        remove(0);
-                }
+        final ReentrantLock lock = this.lock;
+        lock.lock();
+        try {
+            size += p.getLength();
+            int maxsize = getMaxBufSize();
+            DatagramPacket d;
+            while (size > maxsize) {
+                d = bufList.poll();
+                if (d == null)
+                    break;
+                size -= d.getLength();
             }
+            bufList.add(p);
+            notEmpty.signal();
+            return true;
+        } finally {
+            lock.unlock();
         }
-        return added;
+    }
+
+    public void addAll(Collection<DatagramPacket> c) {
+        if (c == null) throw new NullPointerException();
+
+        final ReentrantLock lock = this.lock;
+        lock.lock();
+        try {
+            //add all packet from c
+            for(DatagramPacket d: c) {
+                if (d == null) throw new NullPointerException();
+                bufList.add(d);
+                size += d.getLength();
+            }
+
+            //remove excessive packet
+            int maxsize = getMaxBufSize();
+            DatagramPacket d;
+            while (size > maxsize) {
+                d = bufList.poll();
+                if (d == null)
+                    break;
+                size -= d.getLength();
+            }
+
+            notEmpty.signalAll();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 
+     * @return
+     */
+    public int bufNbElem() {
+        final ReentrantLock lock = this.lock;
+        lock.lock();
+        try {
+            return bufList.size();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 
+     * @return
+     */
+    public int bufSize() {
+        final ReentrantLock lock = this.lock;
+        lock.lock();
+        try {
+            return size;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 
+     */
+    public DatagramPacket poll()
+    {
+        final ReentrantLock lock = this.lock;
+        lock.lock();
+        try {
+            DatagramPacket d = bufList.poll();
+            if (d != null) {
+                size -= d.getLength();
+            }
+            return d;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 
+     * @param timeout
+     * @param unit
+     * @return
+     * @throws InterruptedException
+     */
+    public DatagramPacket poll(long timeout, TimeUnit unit) throws InterruptedException {
+        long nanos = unit.toNanos(timeout);
+        final ReentrantLock lock = this.lock;
+        lock.lockInterruptibly();
+        try {
+            DatagramPacket d;
+            while ((d = bufList.poll()) == null) {
+                if (nanos <= 0)
+                    return null;
+                nanos = notEmpty.awaitNanos(nanos);
+            }
+            size -= d.getLength();
+            return d;
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * 
+     * @return
+     */
+    private int getMaxBufSize() {
+        // For the sake of performance, we cache the first result of
+        // getReceiveBufferSize() of DatagramSocket or Socket
+        int receiveBufferSize = this.receiveBufferSize;
+
+        if (receiveBufferSize <= 0)
+        {
+            try
+            {
+                receiveBufferSize = getReceiveBufferSize();
+            }
+            catch (SocketException sex)
+            {
+            }
+            if (receiveBufferSize <= 0)
+            {
+                receiveBufferSize = DEFAULT_RECEIVE_BUFFER_SIZE;
+            }
+            else if (receiveBufferSize
+                    < DEFAULT_RECEIVE_BUFFER_SIZE)
+            {
+                // Well, a manual page on SO_RCVBUF talks about
+                // doubling. In order to stay on the safe side and
+                // given that there was no limit on the size of the
+                // buffer before, double the receive buffer size.
+                receiveBufferSize *= 2;
+            }
+            this.receiveBufferSize = receiveBufferSize;
+        }
+
+        return receiveBufferSize;
     }
 
     /**
@@ -123,28 +244,4 @@ abstract class SocketReceiveBuffer
      */
     public abstract int getReceiveBufferSize()
         throws SocketException;
-
-    /**
-     * {@inheritDoc}
-     */
-    @Override
-    public DatagramPacket remove(int index)
-    {
-        DatagramPacket p = super.remove(index);
-
-        // Keep track of the (total) size in bytes of this receive buffer in
-        // order to be able to enforce SO_RCVBUF.
-        if (p != null)
-        {
-            int pSize = p.getLength();
-
-            if (pSize > 0)
-            {
-                size -= pSize;
-                if (size < 0)
-                    size = 0;
-            }
-        }
-        return p;
-    }
 }
